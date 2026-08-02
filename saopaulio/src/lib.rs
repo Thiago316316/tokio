@@ -1,6 +1,9 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Reverse;
 
+mod wheel;
+
+
     struct Timers<T> {
         heap: BinaryHeap<Reverse<(u64, u64)>>,
         payloads: HashMap<u64, T>, 
@@ -78,7 +81,16 @@ mod tests {
 
         let start = std::time::Instant::now();
         for id in ids { t.cancel(id); }
-        eprintln!("n={n} took {:?}", start.elapsed());
+        eprintln!("n={n} took {:?} on BinaryHeap", start.elapsed());
+
+        /*let n_wheel = 10_000;
+        let mut wheel: wheel::Wheel<u64> = wheel::Wheel::new();
+        let ids_double: Vec<u64> = (0..n_wheel).map(|i| wheel.insert(i, i).unwrap()).collect();
+        let start = std::time::Instant::now();
+        for id in ids_double { wheel.cancel(id); }
+        eprintln!("n={n_wheel} took {:?} on Wheel", start.elapsed());*/
+        // Wheel cancel benchmark deferred to Step 3 — a single level
+        // holds at most 64 timers, so there's nothing to measure yet.
     }
 
     #[test]
@@ -156,7 +168,7 @@ mod tests {
 
     #[test]
     fn next_deadline_is_the_minimum(){
-        let mut timers: Timers<char> = setup_timers();
+        let timers: Timers<char> = setup_timers();
 
         assert_eq!(timers.next_deadline(), Some(10));
     }
