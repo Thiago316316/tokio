@@ -1,4 +1,54 @@
- 
+//! A single-level timing wheel.
+//!
+//! # Why not a heap
+//!
+//! A `BinaryHeap` of `(deadline, id)` peeks the minimum in O(1), but pays
+//! O(log n) comparisons per insert and per pop, and cannot cancel at all: the
+//! heap property orders parent-to-child only, so no arithmetic locates an
+//! arbitrary entry. Removal is O(n) by construction.
+//!
+//! The wheel replaces searching with addressing.
+//!
+//! # The stripe
+//!
+//! 64 slots, one millisecond each. A deadline's slot is `deadline % 64` — the
+//! same digit extraction as reading the hundreds place of 5789 with
+//! `(5789 / 100) % 10`, but in base 64, where `/` and `%` are `>> 6` and `& 63`.
+//!
+//! `% 64` keeps a position on the ring and throws the lap count away. That is
+//! only unambiguous while at most one lap is in flight, which is exactly what
+//! `TooFar` / `Elapsed` enforce: the live window is `[elapsed, elapsed + 64)`,
+//! one lap wide, so each slot has at most one possible deadline.
+//!
+//! `insert` and `next_deadline` are therefore O(1) — arithmetic, not search.
+//!
+//! # `occupied`
+//!
+//! Two parallel structures of length 64: `slots` holds the timers, `occupied`
+//! is a 64-bit summary where bit n is set **iff** `slots[n]` is non-empty.
+//! `1u64 << n` is an address, not a quantity — the mask's zeros are what leave
+//! the other bits alone.
+//!
+//! The bitmask exists for one reader, `next_deadline`, which a runtime calls
+//! before every park to decide how long it may sleep. `rotate_right` +
+//! `trailing_zeros` searches all 64 slots in ~3 instructions; `rotate` rather
+//! than `shift` so slots behind "now" wrap to the far end as next revolution
+//! instead of being deleted.
+//!
+//! Every mutation of a slot must restore the invariant. `cancel` is the only
+//! site where the clear is conditional — removing one of several entries must
+//! leave the bit set. Drift there is silent and fatal (a timer that never
+//! fires), which is what `next_deadline_matches_brute_force` guards.
+//!
+//! # Still missing
+//!
+//! - `cancel` scans all 64 slots, because an id does not say which slot it is
+//!   in. Carrying the deadline in the handle turns the scan into one `% 64`.
+//! - Within a slot, removal is O(len) plus a `Vec` shift. Tokio's entries carry
+//!   their own `prev`/`next`, so an entry unlinks itself in O(1).
+//! - One level caps deadlines at 64ms out. Six levels, each counting the laps
+//!   of the level below, lift that to ~2 years.
+
 use std::array;
 
  struct Entry<T>{
@@ -20,6 +70,12 @@ pub enum InsertError{
     Elapsed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct TimerHandle{
+    id: u64,
+    slot: usize,
+}
+
  impl<T> Wheel<T> {
     pub fn new() -> Self{
         Wheel{
@@ -30,7 +86,7 @@ pub enum InsertError{
         }
     }
 
-    pub fn insert(&mut self, deadline: u64, payload:T) -> Result<u64, InsertError>{
+    pub fn insert(&mut self, deadline: u64, payload:T) -> Result<TimerHandle, InsertError>{
         if deadline < self.elapsed{
             return Err(InsertError::Elapsed);
         }
@@ -48,7 +104,7 @@ pub enum InsertError{
         // the whole stetment is build a mask with 1 at the position of slot (1u64 << slot) and do OR with the mask.
         // the new one has 0000 1000, with |= the only change is on the 4th bit, if it was 0 it becomes 1, if it was
         // 1 it stays 1 becuse 0(new)+1(mask)=1(mask) and 0(new)+0(mask)=0(mask).
-        Ok(id)
+        Ok(TimerHandle { id, slot })
     }
 
     pub fn expire(&mut self, now: u64) -> Vec<T>{
@@ -64,7 +120,7 @@ pub enum InsertError{
             self.occupied &= !(1u64 << slot); // similar with the above, but now we want to set the bit to 0
                                               // for this we set at the slot position to 1, the rest is zero, then
                                               // flip everything with !, now we do an &= AND, only 1+1=1 the rest is 0,
-                                              // wich means that everything still unchanged, only the position
+                                              // wich means that everything still unch4anged, only the position
                                               // where the 1 needs to be 0 is affected.
         }
         self.elapsed = now + 1; // advance the wheel to the next tick
@@ -98,17 +154,15 @@ pub enum InsertError{
         Some(self.elapsed + zeros as u64)
     }
 
-    pub fn cancel(&mut self, id: u64) -> Option<T>{
-        for slot_index in 0..64{
+    pub fn cancel(&mut self, handle: TimerHandle) -> Option<T>{
             
-            let slot = &mut self.slots[slot_index];
-            if let Some(inner_position) = slot.iter().position(|entry| entry.id == id ){
-                let entry = slot.remove(inner_position);
-                if slot.is_empty(){
-                    self.occupied &= !(1u64 << slot_index);
-                }
-                return Some(entry.payload);
+        let slot = &mut self.slots[handle.slot];
+        if let Some(inner_position) = slot.iter().position(|entry| entry.id == handle.id ){
+            let entry = slot.remove(inner_position);
+            if slot.is_empty(){
+                self.occupied &= !(1u64 << handle.slot); // clear the bit if the slot is empty
             }
+            return Some(entry.payload);
         }
         None
     }
@@ -207,8 +261,8 @@ mod tests {
     #[test]
     fn cancelled_timer_does_not_fire(){
         let mut wheel = Wheel::<String>::new();
-        let id = wheel.insert(10, "timer1".to_string()).unwrap();
-        let cancelled = wheel.cancel(id);
+        let handle = wheel.insert(10, "timer1".to_string()).unwrap();
+        let cancelled = wheel.cancel(handle);
         assert_eq!(cancelled, Some("timer1".to_string()));
         let expired = wheel.expire(10);
         assert_eq!(expired, Vec::<String>::new());
@@ -245,10 +299,10 @@ mod tests {
     #[test]
     fn cancel_one_of_two_keeps_the_slot_occupied() {
         let mut wheel = Wheel::<char>::new();
-        let id_a = wheel.insert(10, 'A').unwrap();
-        let _id_b = wheel.insert(10, 'B').unwrap();
+        let handle_a = wheel.insert(10, 'A').unwrap();
+        let _handle_b = wheel.insert(10, 'B').unwrap();
 
-        assert_eq!(wheel.cancel(id_a), Some('A'));
+        assert_eq!(wheel.cancel(handle_a), Some('A'));
 
         // 'B' still lives in slot 10, so bit 10 must still be set. If `cancel`
         // cleared it unconditionally, the fast path reports None and 'B' would
@@ -261,9 +315,9 @@ mod tests {
     #[test]
     fn cancel_the_last_entry_clears_the_slot() {
         let mut wheel = Wheel::<char>::new();
-        let id = wheel.insert(10, 'A').unwrap();
+        let handle = wheel.insert(10, 'A').unwrap();
 
-        assert_eq!(wheel.cancel(id), Some('A'));
+        assert_eq!(wheel.cancel(handle), Some('A'));
 
         // Slot 10 is now empty, so bit 10 must be clear. Leaving it set would
         // make the fast path report a deadline with nothing behind it.
@@ -281,7 +335,7 @@ mod tests {
     fn next_deadline_matches_brute_force() {
         let mut wheel = Wheel::<u64>::new();
         let mut rng = Rng(0x2545F4914F6CDD1D);
-        let mut live: Vec<u64> = Vec::new(); // ids we have inserted
+        let mut live: Vec<TimerHandle> = Vec::new(); // ids we have inserted
 
         for step in 0..2000 {
             match rng.below(3) {
@@ -289,8 +343,8 @@ mod tests {
                     // INSERT. Staying inside [elapsed, elapsed + 64) keeps us
                     // off the TooFar/Elapsed paths, which are tested elsewhere.
                     let deadline = wheel.elapsed + rng.below(64);
-                    if let Ok(id) = wheel.insert(deadline, deadline) {
-                        live.push(id);
+                    if let Ok(handle) = wheel.insert(deadline, deadline) {
+                        live.push(handle);
                     }
                 }
                 1 => {
@@ -298,8 +352,8 @@ mod tests {
                     // some of these are misses — that exercises the None path.
                     if !live.is_empty() {
                         let i = rng.below(live.len() as u64) as usize;
-                        let id = live.swap_remove(i);
-                        wheel.cancel(id);
+                        let handle = live.swap_remove(i);
+                        wheel.cancel(handle);
                     }
                 }
                 _ => {
