@@ -92,50 +92,51 @@
 //! tracing, and the no-allocation vtable — not the idea.
 
 use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, Wake, Waker},
-    thread,
-    time::Duration,
+    cell::RefCell, collections::VecDeque, future::Future, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, task::{Context, Poll, Wake, Waker}, thread, time::Duration,
 };
 
+struct Executor{
+    queue: Mutex<VecDeque<Arc<Task>>>,
+    executor: Mutex<Option<thread::Thread>>,
+}
 struct Task{
-    future:RefCell<//at run time provides interior mutability, in the Arc scenary, we have alaways have a refference 
-                   //not the future, so we use this have mutable access to the future.
-        Pin< //fixate the position of the pointer, we have something on the heap, but the Task just have 
-             //the pointer to it, and this is what we fixate it.
-            Box< //in runtime alloc a space on the heap for the type inside it, that is dynamically sized.
-                dyn Future< //means that we don't know the concrete future type.
-                    Output = () //just means that the return needs to void.
-                    >>>>,
-    queue: std::rc::Rc<RefCell<VecDeque<Arc<Task>>>>,
-    executor: thread::Thread,
+    future:Mutex<// lock gurad mechanism to handle data between threads.
+        Option< //transform the result into an enum with two option Some or None.
+            Pin< //fixate the position of the pointer, we have something on the heap, but the Task just have 
+                //the pointer to it, and this is what we fixate it.
+                Box< //in runtime alloc a space on the heap for the type inside it, that is dynamically sized.
+                    dyn Future< //means that we don't know the concrete future type.
+                        Output = () //just means that the return needs to void.
+                        > + Send
+                        >>>>,
+    exec: Arc<Executor>,
+    notified: AtomicBool,
 }
 //here we implement the struct of our Task, a place to put a future 
 //and a queue to poll it from, when runing and pushing when waking
 
-unsafe impl Send for Task{} 
-unsafe impl Sync for Task{} 
-///! wrong, need to solve later
 
 impl Task {
     fn poll(self: Arc<Self>) {
+        self.notified.store(false, Ordering::Release);
+        
         let waker = Waker::from(self.clone());
         let mut cx = Context::from_waker(&waker);
 
-        let mut future = self.future.borrow_mut();//get mutable access to the pined
-                                                                                              // refference on the heap.
+        let mut future_op = self.future.lock().unwrap();//get mutable access to the pined
+                                                                                   // refference on the heap.
+
+        let Some(future) = future_op.as_mut() 
+            else { return; };
 
         match future.as_mut()/*mutable future inside the ReffCell<Pin<Box*/.poll(&mut cx) {
             Poll::Ready(()) => {
-                println!("task finished");
+                println!("\nTask.poll(): task finished");
+                *future_op = None;
             }
 
             Poll::Pending => {
-                println!("task returned Pending");
+                println!("\nTask.poll(): task returned Pending");
             }
         }
     }
@@ -145,34 +146,45 @@ impl Task {
 
 impl Wake for Task {
     fn wake(self: Arc<Self>) {
-        println!("WAKER: putting task back into queue");
-        let arc_bump = self.clone();
-        self.queue.borrow_mut().push_back(arc_bump);
+        println!("\nwake(): check notified state");
+        if self.notified.swap(true,Ordering::AcqRel) {
+        println!("\nwake(): stop please you are alredy wake");
+            return;
+        }
 
-        self.executor.unpark();//giving the hability to unpark the thread when the time to check again come 
+        println!("\nwake(): putting task back into queue");
+        let arc_bump = self.clone();
+        self.exec.queue.lock().unwrap().push_back(arc_bump);
+
+        println!("\nwake(): unparking the thread: {:?}", thread::current().id());
+        self
+        .exec
+        .executor
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .unpark();//giving the hability to unpark the thread when the time to check again come 
     }//get tthe Task and put on the queue to be polled again
 }
 
-fn spawn<F>(
-    future: F, 
-    queue: &std::rc::Rc<RefCell<VecDeque<Arc<Task>>>>,
-    executor: thread::Thread,)
-    where F: Future<Output = ()> + 'static,
+fn spawn<F>(future: F,)
+    where F: Future<Output = ()> +Send + 'static,
 {
-    let task = Arc::new(Task {
-        future: RefCell::new(Box::pin(future)),
-        queue: queue.clone(),   //thhe clone, just clone the pointer, not the value, 
-                                //so the queue is only one, tehre aren't different clones
-                                //with different quantities of the same queue
-        executor,
+    CURRENT_RUNTIME.with(|runtime| {
+        let runtime = runtime.borrow();
+        let runtime = runtime.as_ref().expect("no runtime running");
 
-    }); //this ins't makeing other, separate, Task, becuse its an Arc there is 
-        //only one value with referencing bumping, the only new thing is the future
-        //even queue is only cloned, which in Arc is just a ref bump
+        let task = Arc::new(Task{
+            future: Mutex::new(Some(Box::pin(future))),
+            exec: runtime.exec.clone(),
+            notified: AtomicBool::new(false),
+        });
 
-    queue.borrow_mut().push_back(task);
+        runtime.exec.queue.lock().unwrap().push_back(task);
+    });
 
-    println!("spawn: task added to queue")
+    println!("\nspawn(): task added to queue")
 }//build a new task.future and put it on the queue
 
 struct Twice {
@@ -188,39 +200,35 @@ impl Future for Twice {
     ) -> Poll<()> {
         self.poll_count += 1;
 
-        println!("Twice::poll() #{}", self.poll_count);
+        println!("\nTwice::poll() #{}", self.poll_count);
 
         if self.poll_count >= 2 {
             Poll::Ready(())
         } else {
-            cx.waker().wake_by_ref();///! can push to queue two times, need to solve later
+            cx.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
             Poll::Pending
         }
     }//this is like a toll, we need to pass by this two times, the first will return Pending, 
      //then the next Ready. this is a fake/semi future.
 }
 
-fn run(queue: std::rc::Rc<RefCell<VecDeque<Arc<Task>>>>) {
+fn run(exec: Arc<Executor>) {
 
-    let executor = thread::current();//? where i will use this?
-
-    loop{
-        let task = queue.borrow_mut().pop_front();
+    loop {
+        let task = {
+            exec.queue.lock().unwrap().pop_front()
+        };
 
         match task {
             Some(task) => {
-                println!("EXECUTOR: polling task");
-
-                task.poll()
-            }
-
-            None => {
-                println!("EXECUTOR: queue empty");
-                thread::park();
-            }
+                println!("run(): Executor polling task");
+                task.poll();
+            },
+            None => break,
         }
     }
-}//get a queue as mutable, pop the first task, see if the task return something, then pull it.
+}
 
 struct  ThreadWaker{
     thread: thread::Thread,
@@ -232,10 +240,19 @@ impl Wake for ThreadWaker{
     }
 }
 
-fn block_on<F>(future: F) -> F::Output
+fn block_on<F>(future: F, exec: Arc<Executor>) -> F::Output
 where F: Future,
 {
     let thread = thread::current();
+    println!("\nblock_on(): current thread {:?}", thread.id());
+    *exec.executor.lock().unwrap() = Some(thread.clone());
+    
+
+    CURRENT_RUNTIME.with(|runtime|{
+        *runtime.borrow_mut() = Some(RuntimeContext { 
+            exec: exec.clone(), 
+        });
+    });
 
     let waker = Waker::from(Arc::new(ThreadWaker{
         thread: thread.clone(),//cloning the rust thread handler, not the thread per se
@@ -244,62 +261,22 @@ where F: Future,
     }));
 
     let mut cx = Context::from_waker(&waker);
-
     let mut future_fixed_on_heap = Box::pin(future);
 
     loop {
         match future_fixed_on_heap.as_mut().poll(&mut cx) {
             Poll::Ready(value) => return value,
-            Poll::Pending => {thread::park();}
-        }//we basically loop eternally and park the thread until the future returns Ready
-    }
-}
-
-struct  WakeOnce{
-    waker: Option<Waker>,
-    started: bool,
-    done: bool,
-}
-impl Future for WakeOnce {
-    type Output = ();
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<()> {
-        if self.done {
-            println!("Future: Ready");
-            return Poll::Ready(());
+            Poll::Pending => { println!("\nblock_on(): main future Pending") }
         }
+        run(exec.clone());
 
-        if !self.started {
-            println!("Future: first poll -> Pending");
-
-            self.started = true;
-            self.waker = Some(cx.waker()//this isn't the wake function of Task, 
-                                              //Context has its own wake that return the waker
-                                              //that the executor gave to this particular poll()
-            .clone());
-
-            let waker = self.waker.as_ref().unwrap().clone();
-
-            thread::spawn(move || {
-                println!("Other thread {:?}: sleeping...", thread::current().id());
-                thread::sleep(Duration::from_secs(1));
-
-                println!("Other thread {:?}: wake()",thread::current().id());
-                waker.wake();
-            });
-        }
-
-        self.done = true;
-
-        Poll::Pending
+        println!("\nblock_on(): Executor parking");
+        thread::park();
     }
 }
 
 struct WaitOnce {
-    started: bool,
+    started: Arc<AtomicBool>,
 }
 
 impl Future for WaitOnce {
@@ -309,20 +286,20 @@ impl Future for WaitOnce {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<()> {
-        if self.started {
-            println!("WaitOnce: Ready");
+        if self.started.load(Ordering::Acquire) {
+            println!("\nWaitOnce.poll(): Ready");
             Poll::Ready(())
         } else {
-            println!("WaitOnce: Pending");
+            println!("\nWaitOnce.poll(): Pending");
 
-            self.started = true;
 
             let waker = cx.waker().clone();
-
+            let ready = self.started.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(100));
+                ready.store(true, Ordering::Release);
 
-                println!("OTHER THREAD: wake()");
+                println!("\nWaitOnce.poll(): OTHER THREAD wake()");
                 waker.wake();
             });
 
@@ -331,40 +308,57 @@ impl Future for WaitOnce {
     }
 }
 
-pub fn main() {
-    let queue = std::rc::Rc::new(
-        RefCell::new(VecDeque::new())
-    );
-
-    let executor = thread::current();
-
-    spawn(
-        async {
-            println!("task started");
-
-            Twice {poll_count: 0}.await;
-
-            println!("task complete");
-        },
-        &queue,
-        executor.clone(),
-        );
-
-    block_on(WaitOnce{started: false});
-        
-    run(queue);
+#[derive(Clone)]
+struct RuntimeContext {
+    exec: Arc<Executor>,
 }
 
+thread_local! {
+    static CURRENT_RUNTIME: RefCell<Option<RuntimeContext>> = RefCell::new(None);
+}
 
-mod tests {
-    use crate::m0_task::block_on;
+pub fn main() {
+    let executor = Arc::new(Executor {
+        queue: Mutex::new(VecDeque::new()),
+        executor: Mutex::new(None),
+    });
 
-    #[test]
-    fn block_on_waits_until_woken() {
-        let result = block_on(
-            async{ 42 }
-        );
-        assert_eq!(result, 42);
-    } 
+    block_on(
+        async {
+            println!("\nmain()block_on()future block: main future started");
 
+            spawn(
+            async {
+                println!("\nmain()block_on()future block -> spawn()future block: task 1 started");
+
+                Twice{poll_count:0}.await;
+
+                println!("\nmain()block_on()future block -> spawn()future block: task one complete");
+                }, 
+            );
+
+            println!("\nmain()block_on()future block: main future waiting");
+
+            WaitOnce {started: Arc::new(AtomicBool::new(false))}.await;
+
+            println!("\nmain()block_on()future block: main future complete");
+
+            println!("\nmain()block_on()future block: inner runtime context test start");
+
+            spawn(async {
+                println!("task A");
+
+                spawn(async {
+                    println!("task B");
+                });
+            });
+
+            println!("\nmain()block_on()future block: inner runtime context test end");
+
+        },
+        executor.clone(),
+    );
+    
+    
+    run(executor.clone());
 }
