@@ -92,12 +92,26 @@
 //! tracing, and the no-allocation vtable — not the idea.
 
 use std::{
-    cell::RefCell, collections::VecDeque, future::Future, pin::Pin, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, task::{Context, Poll, Wake, Waker}, thread, time::Duration,
+    cell::RefCell,
+    collections::{VecDeque,HashMap}, 
+    future::Future, 
+    pin::Pin, 
+    sync::{
+        Arc, Mutex, 
+        atomic::{AtomicBool, AtomicUsize, Ordering}}, 
+    task::{Context, Poll, Wake, Waker}, 
+    thread, 
+    time::Duration,
 };
 
 struct Executor{
     queue: Mutex<VecDeque<Arc<Task>>>,
     executor: Mutex<Option<thread::Thread>>,
+    owned: Mutex<HashMap<usize,Arc<Task>>>,// holds a strong ref to every task, and every task holds a 
+                                           //strong Arc<Executor>, so keep in mind that a task that 
+                                           //stays Pending forever keeps itself and the entire executor
+                                           //alive forever, "silently leaked".
+    next_task_id: AtomicUsize,
 }
 struct Task{
     future:Mutex<// lock gurad mechanism to handle data between threads.
@@ -111,6 +125,7 @@ struct Task{
                         >>>>,
     exec: Arc<Executor>,
     notified: AtomicBool,
+    id: usize,// id to track the task in the scenario where it was polled but not waked, then got silently droped.
 }
 //here we implement the struct of our Task, a place to put a future 
 //and a queue to poll it from, when runing and pushing when waking
@@ -118,6 +133,8 @@ struct Task{
 
 impl Task {
     fn poll(self: Arc<Self>) {
+        let _runtime_guard = RuntimeContextGurad::enter(self.exec.clone());
+
         self.notified.store(false, Ordering::Release);
         
         let waker = Waker::from(self.clone());
@@ -126,19 +143,28 @@ impl Task {
         let mut future_op = self.future.lock().unwrap();//get mutable access to the pined
                                                                                    // refference on the heap.
 
-        let Some(future) = future_op.as_mut() 
+        let Some(future) = future_op.as_mut() /*A task panic must not be assumed 
+                                    to be an isolated task failure. In your current runtime, it can terminate the executor. */
             else { return; };
 
-        match future.as_mut()/*mutable future inside the ReffCell<Pin<Box*/.poll(&mut cx) {
+        let completed = match future.as_mut()/*mutable future inside the ReffCell<Pin<Box*/.poll(&mut cx) {
             Poll::Ready(()) => {
                 println!("\nTask.poll(): task finished");
                 *future_op = None;
+                true
             }
 
             Poll::Pending => {
                 println!("\nTask.poll(): task returned Pending");
+                false
             }
-        }
+        };
+
+        drop(future_op);
+
+        if completed {
+            self.exec.owned.lock().unwrap().remove(&self.id);
+        }// if the task returned ready, then we can drop the task from the track "owned".
     }
     //poll basically receive an Arc<Task>, build a wake with it and make a context
     //then borrow as mutable to match it with the two scenary (Read and Pending)
@@ -168,24 +194,274 @@ impl Wake for Task {
     }//get tthe Task and put on the queue to be polled again
 }
 
-fn spawn<F>(future: F,)
-    where F: Future<Output = ()> +Send + 'static,
-{
-    CURRENT_RUNTIME.with(|runtime| {
-        let runtime = runtime.borrow();
-        let runtime = runtime.as_ref().expect("no runtime running");
+fn run(exec: Arc<Executor>) {
 
-        let task = Arc::new(Task{
-            future: Mutex::new(Some(Box::pin(future))),
-            exec: runtime.exec.clone(),
-            notified: AtomicBool::new(false),
+    loop {
+        let task = {
+            exec.queue.lock().unwrap().pop_front()
+        };
+
+        match task {
+            Some(task) => {
+                println!("run(): Executor polling task");
+                println!("!! Live owned tasks !!! {:?}", exec.owned.lock().unwrap().keys().clone());
+                task.poll();
+            },
+            None => break,
+        }
+    }
+}
+
+struct  ThreadWaker{
+    thread: thread::Thread,
+}
+
+impl Wake for ThreadWaker{
+    fn wake(self: Arc<Self>){
+        self.thread.unpark();
+    }
+}
+
+struct RuntimeContextGurad {
+    previous: Option<RuntimeContext>,
+}
+
+impl RuntimeContextGurad {
+    fn enter(exec: Arc<Executor>) -> Self {
+        let previous = CURRENT_RUNTIME.with(|runtime| {
+            runtime
+                .borrow_mut()
+                .replace(RuntimeContext { exec })
         });
 
-        runtime.exec.queue.lock().unwrap().push_back(task);
-    });
+        Self { previous }
+    }
+}
 
-    println!("\nspawn(): task added to queue")
-}//build a new task.future and put it on the queue
+impl Drop for RuntimeContextGurad {
+    fn drop(&mut self){
+        let previous = self.previous.take();
+
+        CURRENT_RUNTIME.with(|runtime| {
+            *runtime.borrow_mut() = previous;
+        });
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeContext {
+    exec: Arc<Executor>,
+}
+
+thread_local! {
+    static CURRENT_RUNTIME: RefCell<Option<RuntimeContext>> = RefCell::new(None);
+}
+
+#[derive(Clone)]
+pub struct Runtime {exec: Arc<Executor>}
+
+impl Runtime {
+    pub fn new() -> Self {
+        let executor = Self {
+            exec:
+                Arc::new(Executor {
+                queue: Mutex::new(VecDeque::new()),
+                executor: Mutex::new(None),
+                owned: Mutex::new(HashMap::new()),
+                next_task_id: AtomicUsize::new(1),
+            })
+        };
+
+        executor
+    }
+
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output{
+        let thread = thread::current();
+        println!("\nblock_on(): current thread {:?}", thread.id());
+        *self.exec.executor.lock().unwrap() = Some(thread.clone());
+
+        let _runtime_guard = RuntimeContextGurad::enter(self.exec.clone());
+
+        let waker = Waker::from(Arc::new(ThreadWaker{
+            thread: thread.clone(),
+        }));
+
+        let mut cx = Context::from_waker(&waker);
+        let mut future_fixed_on_heap = Box::pin(future);
+
+        let result = loop {
+            match future_fixed_on_heap.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => break value,
+                Poll::Pending => { println!("\nblock_on(): main future Pending") }
+            }
+            run(self.exec.clone());
+
+            println!("\nblock_on(): Executor parking");
+            thread::park();
+        };
+
+        result
+    }
+
+    pub fn spawn<F>(future: F,)
+        where F: Future<Output = ()> +Send + 'static,
+    {
+        CURRENT_RUNTIME.with(|runtime| {
+            let runtime = runtime.borrow();
+            let runtime = runtime.as_ref().expect("no runtime running");
+            let task_id = runtime.exec.next_task_id.fetch_add(1, Ordering::Relaxed);
+
+            let task = Arc::new(Task{
+                future: Mutex::new(Some(Box::pin(future))),
+                exec: runtime.exec.clone(),
+                notified: AtomicBool::new(true),
+                id: task_id
+            });
+
+            runtime.exec.owned.lock().unwrap().insert(task_id, task.clone());
+
+            runtime.exec.queue.lock().unwrap().push_back(task);
+        });
+
+        println!("\nspawn(): task added to queue")
+    }//build a new task.future and put it on the queue
+
+    pub fn run_until_idle(&self){
+        loop {
+        let task = {
+            self.exec.queue.lock().unwrap().pop_front()
+        };
+
+        match task {
+            Some(task) => {
+                println!("run(): Executor polling task");
+                println!("!! Live owned tasks !!! {:?}", self.exec.owned.lock().unwrap().keys().clone());
+                task.poll();
+            },
+            None => break,
+        }
+    }
+    }
+
+}
+
+pub fn main() {
+    let executor = Runtime::new();
+    executor.block_on(
+        async {
+            println!("\nmain()block_on()future block: main future started");
+
+            Runtime::spawn(
+            async {
+                println!("\nmain()block_on()future block -> spawn()future block: task 1 started");
+
+                Twice{poll_count:0}.await;
+
+                println!("\nmain()block_on()future block -> spawn()future block: task one complete");
+                }, 
+            );
+
+            println!("\nmain()block_on()future block: main future waiting");
+
+            WaitOnce {started: Arc::new(AtomicBool::new(false))}.await;
+
+            println!("\nmain()block_on()future block: main future complete");
+
+            println!("\nmain()block_on()future block: inner runtime context test start");
+
+            Runtime::spawn(async {
+                println!("task A");
+
+                Runtime::spawn(async {
+                    println!("task B");
+                });
+            });
+
+            Runtime::spawn(async {
+                println!("Yield Task A: start");
+                yield_now().await;
+                println!("Yield Task A: resumed");
+            });
+
+            Runtime::spawn(async {
+                println!("Yield Task B: start");
+                yield_now().await;
+                println!("Yield Task B: resumed");
+            });
+
+            Runtime::spawn(async {
+                println!("Yield Task C: start");
+                yield_now().await;
+                println!("Yield Task C: resumed");
+            });
+
+            println!("\nmain()block_on()future block: inner runtime context test end");
+
+        },
+    );
+    
+    Runtime::run_until_idle(&executor);
+}
+
+
+struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()>
+    {
+        if self.yielded{
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+async fn yield_now() {
+    YieldNow {yielded: false}.await
+}
+
+struct WaitOnce {
+    started: Arc<AtomicBool>,
+}
+
+impl Future for WaitOnce {
+    type Output = ();
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        if self.started.load(Ordering::Acquire) {
+            println!("\nWaitOnce.poll(): Ready");
+            Poll::Ready(())
+        } else {
+            println!("\nWaitOnce.poll(): Pending");
+
+
+            let waker = cx.waker().clone();
+            let ready = self.started.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                ready.store(true, Ordering::Release);
+
+                println!("\nWaitOnce.poll(): OTHER THREAD wake()");
+                waker.wake();
+            });
+
+            Poll::Pending
+        }
+    }
+}
 
 struct Twice {
     poll_count: usize,
@@ -211,154 +487,4 @@ impl Future for Twice {
         }
     }//this is like a toll, we need to pass by this two times, the first will return Pending, 
      //then the next Ready. this is a fake/semi future.
-}
-
-fn run(exec: Arc<Executor>) {
-
-    loop {
-        let task = {
-            exec.queue.lock().unwrap().pop_front()
-        };
-
-        match task {
-            Some(task) => {
-                println!("run(): Executor polling task");
-                task.poll();
-            },
-            None => break,
-        }
-    }
-}
-
-struct  ThreadWaker{
-    thread: thread::Thread,
-}
-
-impl Wake for ThreadWaker{
-    fn wake(self: Arc<Self>){
-        self.thread.unpark();
-    }
-}
-
-fn block_on<F>(future: F, exec: Arc<Executor>) -> F::Output
-where F: Future,
-{
-    let thread = thread::current();
-    println!("\nblock_on(): current thread {:?}", thread.id());
-    *exec.executor.lock().unwrap() = Some(thread.clone());
-    
-
-    CURRENT_RUNTIME.with(|runtime|{
-        *runtime.borrow_mut() = Some(RuntimeContext { 
-            exec: exec.clone(), 
-        });
-    });
-
-    let waker = Waker::from(Arc::new(ThreadWaker{
-        thread: thread.clone(),//cloning the rust thread handler, not the thread per se
-                               //and we clone becuse block_on will be runing with one, 
-                               //so it need to have its own
-    }));
-
-    let mut cx = Context::from_waker(&waker);
-    let mut future_fixed_on_heap = Box::pin(future);
-
-    loop {
-        match future_fixed_on_heap.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => { println!("\nblock_on(): main future Pending") }
-        }
-        run(exec.clone());
-
-        println!("\nblock_on(): Executor parking");
-        thread::park();
-    }
-}
-
-struct WaitOnce {
-    started: Arc<AtomicBool>,
-}
-
-impl Future for WaitOnce {
-    type Output = ();
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<()> {
-        if self.started.load(Ordering::Acquire) {
-            println!("\nWaitOnce.poll(): Ready");
-            Poll::Ready(())
-        } else {
-            println!("\nWaitOnce.poll(): Pending");
-
-
-            let waker = cx.waker().clone();
-            let ready = self.started.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(100));
-                ready.store(true, Ordering::Release);
-
-                println!("\nWaitOnce.poll(): OTHER THREAD wake()");
-                waker.wake();
-            });
-
-            Poll::Pending
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RuntimeContext {
-    exec: Arc<Executor>,
-}
-
-thread_local! {
-    static CURRENT_RUNTIME: RefCell<Option<RuntimeContext>> = RefCell::new(None);
-}
-
-pub fn main() {
-    let executor = Arc::new(Executor {
-        queue: Mutex::new(VecDeque::new()),
-        executor: Mutex::new(None),
-    });
-
-    block_on(
-        async {
-            println!("\nmain()block_on()future block: main future started");
-
-            spawn(
-            async {
-                println!("\nmain()block_on()future block -> spawn()future block: task 1 started");
-
-                Twice{poll_count:0}.await;
-
-                println!("\nmain()block_on()future block -> spawn()future block: task one complete");
-                }, 
-            );
-
-            println!("\nmain()block_on()future block: main future waiting");
-
-            WaitOnce {started: Arc::new(AtomicBool::new(false))}.await;
-
-            println!("\nmain()block_on()future block: main future complete");
-
-            println!("\nmain()block_on()future block: inner runtime context test start");
-
-            spawn(async {
-                println!("task A");
-
-                spawn(async {
-                    println!("task B");
-                });
-            });
-
-            println!("\nmain()block_on()future block: inner runtime context test end");
-
-        },
-        executor.clone(),
-    );
-    
-    
-    run(executor.clone());
 }
