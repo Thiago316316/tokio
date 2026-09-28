@@ -50,3 +50,5 @@ pub mod m5_per_worker_time;
 pub mod m6_lifecycle;
 pub mod m7_coop;
 pub mod m8_blocking;
+
+pub mod time_source;

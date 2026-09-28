@@ -92,19 +92,15 @@
 //! tracing, and the no-allocation vtable — not the idea.
 
 use std::{
-    cell::RefCell,
-    collections::{VecDeque,HashMap}, 
-    future::Future, 
-    pin::Pin, 
-    sync::{
+    cell::RefCell, collections::{HashMap, VecDeque}, future::Future, pin::Pin, sync::{
         Arc, Mutex, 
-        atomic::{AtomicBool, AtomicUsize, Ordering}}, 
-    task::{Context, Poll, Wake, Waker}, 
-    thread, 
-    time::Duration,
+        atomic::{AtomicBool, AtomicUsize, Ordering}}, task::{Context, Poll, Wake, Waker}, thread, time::Duration,
 };
 
-struct Executor{
+use crate::m1_time::{ wheel::Wheel};
+use crate::time_source::TimeSource;
+
+pub(crate) struct Executor{
     queue: Mutex<VecDeque<Arc<Task>>>,
     executor: Mutex<Option<thread::Thread>>,
     owned: Mutex<HashMap<usize,Arc<Task>>>,// holds a strong ref to every task, and every task holds a 
@@ -112,6 +108,8 @@ struct Executor{
                                            //stays Pending forever keeps itself and the entire executor
                                            //alive forever, "silently leaked".
     next_task_id: AtomicUsize,
+    pub(crate) time: Mutex<Wheel<Waker>>,
+    pub(crate) time_source: TimeSource,
 }
 struct Task{
     future:Mutex<// lock gurad mechanism to handle data between threads.
@@ -248,6 +246,27 @@ impl Drop for RuntimeContextGurad {
     }
 }
 
+/// The executor this thread is currently running inside.
+///
+/// `spawn` and `sleep` both need the current runtime but take no handle
+/// argument, so both read it from `CURRENT_RUNTIME`, which
+/// `RuntimeContextGurad::enter` sets on entry to `block_on` and to every
+/// `Task::poll`.
+///
+/// Panics outside a runtime — the same rule tokio has. Note that `Sleep::drop`
+/// must NOT call this: a destructor can run after the runtime is gone, and
+/// panicking in a destructor aborts. `Sleep` holds its own `Arc<Executor>`.
+pub(crate) fn current_exec() -> Arc<Executor> {
+    CURRENT_RUNTIME.with(|runtime| {
+        runtime
+            .borrow()
+            .as_ref()
+            .expect("no runtime running")
+            .exec
+            .clone()
+    })
+}
+
 #[derive(Clone)]
 struct RuntimeContext {
     exec: Arc<Executor>,
@@ -269,6 +288,8 @@ impl Runtime {
                 executor: Mutex::new(None),
                 owned: Mutex::new(HashMap::new()),
                 next_task_id: AtomicUsize::new(1),
+                time_source: TimeSource::new(),
+                time: Mutex::new(Wheel::<Waker>::new()),
             })
         };
 
@@ -290,14 +311,28 @@ impl Runtime {
         let mut future_fixed_on_heap = Box::pin(future);
 
         let result = loop {
-            match future_fixed_on_heap.as_mut().poll(&mut cx) {
-                Poll::Ready(value) => break value,
-                Poll::Pending => { println!("\nblock_on(): main future Pending") }
+            let now = self.exec.time_source.now();
+            let fired = self.exec.time.lock().unwrap().expire(now);
+            for waker in fired{
+                waker.wake();
             }
+            
+            if let Poll::Ready(v) = future_fixed_on_heap.as_mut().poll(&mut cx) {break v;}
+
             run(self.exec.clone());
 
-            println!("\nblock_on(): Executor parking");
-            thread::park();
+            let now = self.exec.time_source.now();
+            let next = self.exec.time.lock().unwrap().next_deadline();
+
+            match next{
+                None => thread::park(),
+                Some(deadline) => {
+                    let wait = deadline.saturating_sub(now);
+                    if wait > 0 {
+                        thread::park_timeout(Duration::from_millis(wait));
+                    }
+                }
+            }
         };
 
         result
@@ -306,22 +341,21 @@ impl Runtime {
     pub fn spawn<F>(future: F,)
         where F: Future<Output = ()> +Send + 'static,
     {
-        CURRENT_RUNTIME.with(|runtime| {
-            let runtime = runtime.borrow();
-            let runtime = runtime.as_ref().expect("no runtime running");
-            let task_id = runtime.exec.next_task_id.fetch_add(1, Ordering::Relaxed);
+        // the RefCell borrow ends here, before any mutex is taken
+        let exec = current_exec();
 
-            let task = Arc::new(Task{
-                future: Mutex::new(Some(Box::pin(future))),
-                exec: runtime.exec.clone(),
-                notified: AtomicBool::new(true),
-                id: task_id
-            });
+        let task_id = exec.next_task_id.fetch_add(1, Ordering::Relaxed);
 
-            runtime.exec.owned.lock().unwrap().insert(task_id, task.clone());
-
-            runtime.exec.queue.lock().unwrap().push_back(task);
+        let task = Arc::new(Task{
+            future: Mutex::new(Some(Box::pin(future))),
+            exec: exec.clone(),
+            notified: AtomicBool::new(true),
+            id: task_id
         });
+
+        exec.owned.lock().unwrap().insert(task_id, task.clone());
+
+        exec.queue.lock().unwrap().push_back(task);
 
         println!("\nspawn(): task added to queue")
     }//build a new task.future and put it on the queue

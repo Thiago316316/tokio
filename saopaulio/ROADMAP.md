@@ -18,7 +18,7 @@ cargo doc --open           # the roadmap as rustdoc — this is the intended way
 
 | | | new concept | status |
 |---|---|---|---|
-| **M0** `m0_task` | `block_on` + `spawn` + a run queue | task, waker, run queue | not started |
+| **M0** `m0_task` | `block_on` + `spawn` + a run queue | task, waker, run queue | done |
 | **M1** `m1_time` | `sleep(dur)` | the wheel | **wheel done**, integration pending |
 | **M2** `m2_io` | TCP via epoll | readiness, the driver stack | not started |
 | **M3** `m3_timeout` | `timeout(dur, fut)` | combinator, cancellation | not started |
