@@ -522,3 +522,284 @@ impl Future for Twice {
     }//this is like a toll, we need to pass by this two times, the first will return Pending, 
      //then the next Ready. this is a fake/semi future.
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    // ------------------------------------------------------------------
+    // Fixture: the minimal "await a flag" primitive.
+    //
+    // Every M0 test needs one task to wait for another, and M0 has no
+    // JoinHandle and no channels. `Signal` is the smallest thing that closes
+    // that gap: a bool plus a waker slot. It is also, in miniature, what
+    // `Notify` and `oneshot` are — which is why it belongs in tests and not in
+    // the module.
+    //
+    // Crucially, a `Wait` polled inside a spawned task stores that TASK's
+    // waker, so waking it exercises `Wake for Task`. A `Wait` awaited directly
+    // in `block_on` stores the `ThreadWaker` instead. The tests below depend on
+    // that difference.
+    // ------------------------------------------------------------------
+    struct Signal {
+        done: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl Signal {
+        fn new() -> Arc<Self> {
+            Arc::new(Signal {
+                done: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            })
+        }
+
+        fn set(&self) {
+            self.done.store(true, Ordering::Release);
+            if let Some(w) = self.waker.lock().unwrap().take() {
+                w.wake();
+            }
+        }
+    }
+
+    struct Wait(Arc<Signal>);
+
+    impl Future for Wait {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0.done.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+            // Re-check: `set` may have run between the load and the store, in
+            // which case that wake went to a waker we just replaced.
+            if self.0.done.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        }
+    }
+
+    /// Run a runtime on its own thread and fail instead of hanging. Every bug
+    /// in this subject presents as a hang, and a hung `cargo test` says nothing.
+    fn with_timeout<F>(secs: u64, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(secs))
+            .expect("the runtime hung — a wakeup was lost");
+    }
+
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn block_on_returns_the_futures_output() {
+        let rt = Runtime::new();
+        assert_eq!(rt.block_on(async { 1 + 1 }), 2);
+    }
+
+    /// The path nothing else covers: `Wake for Task` invoked from a foreign
+    /// thread. `Wait` inside the spawned task holds the Task's waker, so the OS
+    /// thread's `set()` goes through `Task::wake` — push to the queue, then
+    /// unpark the executor. Every `Arc`/`Mutex`/`AtomicBool` in `Executor` and
+    /// `Task` exists to make this sound; before the `unsafe impl Send` was
+    /// removed, this was UB.
+    #[test]
+    fn a_spawned_task_woken_from_another_thread_completes() {
+        with_timeout(5, || {
+            let rt = Runtime::new();
+            let from_os_thread = Signal::new();
+            let task_finished = Signal::new();
+
+            let trigger = from_os_thread.clone();
+            let finished = task_finished.clone();
+
+            rt.block_on(async move {
+                Runtime::spawn(async move {
+                    Wait(trigger).await; // suspends; woken across threads
+                    finished.set();
+                });
+
+                let t = from_os_thread.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(50));
+                    t.set();
+                });
+
+                Wait(task_finished).await;
+            });
+        });
+    }
+
+    /// Two wakes on one task must produce ONE queue entry.
+    ///
+    /// Counting polls of a task that *completes* cannot see this: the second
+    /// queue entry would find `future` already taken and return without
+    /// polling, so the count is the same either way. That masking is test 3's
+    /// invariant, not this one.
+    ///
+    /// So the future here never completes, and `run_until_idle` is driven
+    /// directly — one poll per queue entry, nothing absorbed. Wakes are issued
+    /// only on poll #1, so every poll after that came from a queue entry:
+    ///
+    ///   deduped:     poll 1 (wakes x2 -> 1 entry), poll 2            => 2
+    ///   not deduped: poll 1 (wakes x2 -> 2 entries), poll 2, poll 3  => 3
+    #[test]
+    fn two_wakes_enqueue_the_task_once() {
+        struct WakeTwiceThenStall {
+            polls: Arc<AtomicUsize>,
+        }
+
+        impl Future for WakeTwiceThenStall {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let n = self.polls.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 1 {
+                    let w = cx.waker().clone();
+                    w.wake_by_ref();
+                    w.wake_by_ref();
+                }
+                Poll::Pending // never completes: no `Option` guard to hide behind
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counter = polls.clone();
+
+        let rt = Runtime::new();
+
+        // `spawn` needs CURRENT_RUNTIME, so it has to happen inside `block_on`.
+        // This main future is synchronous, so `block_on` returns having queued
+        // the task without ever polling it.
+        rt.block_on(async move {
+            Runtime::spawn(WakeTwiceThenStall { polls: counter });
+        });
+
+        rt.run_until_idle();
+
+        assert_eq!(
+            polls.load(Ordering::Acquire),
+            2,
+            "two wakes produced more than one queue entry — `notified` is not deduping"
+        );
+    }
+
+    /// A waker that outlives its task must not resurrect it. `Task::poll` takes
+    /// the future out of the `Option` on `Ready`, so a stale wake finds `None`
+    /// and returns without polling.
+    #[test]
+    fn a_completed_task_is_not_polled_again() {
+        struct StashWaker {
+            stash: Arc<Mutex<Option<Waker>>>,
+            polls: Arc<AtomicUsize>,
+        }
+
+        impl Future for StashWaker {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polls.fetch_add(1, Ordering::AcqRel);
+                *self.stash.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Ready(())
+            }
+        }
+
+        let stash: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        let rt = Runtime::new();
+        {
+            let (stash, polls) = (stash.clone(), polls.clone());
+            rt.block_on(async move {
+                let done = Signal::new();
+                let finished = done.clone();
+                Runtime::spawn(async move {
+                    StashWaker { stash, polls }.await;
+                    finished.set();
+                });
+                Wait(done).await;
+            });
+        }
+
+        assert_eq!(polls.load(Ordering::Acquire), 1);
+
+        // The task is finished and off `owned`. Waking it anyway must be inert.
+        stash.lock().unwrap().take().unwrap().wake();
+        rt.run_until_idle();
+
+        assert_eq!(
+            polls.load(Ordering::Acquire),
+            1,
+            "a stale waker re-polled a completed future"
+        );
+    }
+
+    /// `spawn` reads `CURRENT_RUNTIME`, which `Task::poll` enters via
+    /// `RuntimeContextGurad`. So spawning works from inside a poll, with no
+    /// queue argument threaded through.
+    #[test]
+    fn a_task_can_spawn_another_task() {
+        with_timeout(5, || {
+            let rt = Runtime::new();
+            let inner_ran = Signal::new();
+            let signal = inner_ran.clone();
+
+            rt.block_on(async move {
+                Runtime::spawn(async move {
+                    Runtime::spawn(async move {
+                        signal.set();
+                    });
+                });
+                Wait(inner_ran).await;
+            });
+        });
+    }
+
+    /// The M0 checkpoint: three tasks whose interleaving is decided purely by
+    /// the run queue. Each records itself, yields, then records itself again.
+    /// FIFO ordering means all three get their first turn before any gets its
+    /// second — that is the definition of the scheduler being fair.
+    #[test]
+    fn three_tasks_round_robin_through_the_queue() {
+        with_timeout(5, || {
+            let rt = Runtime::new();
+            let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            let done = Signal::new();
+            let remaining = Arc::new(AtomicUsize::new(3));
+
+            let outer_log = log.clone();
+            let outer_done = done.clone();
+
+            rt.block_on(async move {
+                for name in ["A", "B", "C"] {
+                    let log = outer_log.clone();
+                    let remaining = remaining.clone();
+                    let done = outer_done.clone();
+
+                    Runtime::spawn(async move {
+                        log.lock().unwrap().push(name);
+                        yield_now().await;
+                        log.lock().unwrap().push(name);
+
+                        if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            done.set();
+                        }
+                    });
+                }
+                Wait(done).await;
+            });
+
+            assert_eq!(
+                *log.lock().unwrap(),
+                vec!["A", "B", "C", "A", "B", "C"],
+                "tasks did not round-robin — the queue is not FIFO, or yield_now \
+                 re-polls immediately instead of going back to the queue"
+            );
+        });
+    }
+}

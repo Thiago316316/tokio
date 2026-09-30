@@ -107,6 +107,7 @@
 
 pub mod heap;
 pub mod wheel;
+pub mod sleep;
 
 #[cfg(test)]
 mod tests {
@@ -136,3 +137,4 @@ mod tests {
         // number. It is the payoff for the whole module.
     }
 }
+

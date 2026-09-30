@@ -53,33 +53,6 @@ park timeout (M2).
 combined; three things stop being true at once (the queue becomes lock-free,
 the waker becomes concurrent, the wheel goes behind a mutex).
 
-## Done so far — M1
-
-- `m1_time/heap.rs` — `BinaryHeap<Reverse<(deadline, id)>>`. O(n) `cancel`,
-  written first so the wheel answers a problem that was actually felt. Kept
-  permanently as the **oracle** for differential tests.
-- `m1_time/wheel.rs` — hierarchical hashed timing wheel, 6 levels × 64 slots,
-  per-level `occupied` bitmask, cascading expire, address-computed cancel.
-
-38 tests pass. The three that matter:
-
-- `the_wheel_agrees_with_the_heap` — 10k random deadlines through both, 1ms
-  steps, identical output.
-- `..._under_jumpy_expire` — same, but each `expire` cascades several levels
-  and fires several deadlines in one call.
-- `next_deadline_never_overshoots_the_oracle` — 5000 random
-  insert/cancel/expire steps, checked after every one against a brute-force
-  scan of all 384 slots.
-
-## Immediate next step
-
-`m1_time::tests::cancel_cost` still has its wheel half commented out, deferred
-back when one level held at most 64 timers. Step 3 removed that excuse.
-Uncomment it, fix the path to `super::wheel::Wheel`, record the number. It is
-ten minutes and it is the payoff for the whole module.
-
-After that, M0 — M1 cannot finish without something to wake.
-
 ## House rules, borrowed from upstream
 
 - **No performance claim without a reproducer.** PR #6512 shipped
