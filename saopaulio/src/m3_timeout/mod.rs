@@ -73,3 +73,239 @@
 //! above — in a hot path where timeouts almost never fire, even *allocating*
 //! the timer state is measurable overhead. It also ships its own benchmark in
 //! the same commit, which is the house rule.
+
+use crate::m1_time::{sleep::{Sleep}};
+use std::{future::Future, pin::Pin, task::{Context, Poll}};
+pub struct Timeout<F>{
+    future: F,
+    sleep: Sleep,
+}
+
+impl <F: Future> Timeout<F>{
+    
+    pub fn new(future: F, sleep: Sleep) -> Self{
+        Timeout{future, sleep}
+    }
+
+    fn project(self: Pin<&mut Self>) -> (Pin<&mut F>, Pin<&mut Sleep>){
+        unsafe {
+            let this = self.get_unchecked_mut();
+            (
+                Pin::new_unchecked(&mut this.future),
+                Pin::new_unchecked(&mut this.sleep),
+            )
+        }// don't ever move the children out of the reutrn of this function!!!!!
+         // this is the tacit guarantee that the children never can be moved out of parent
+         //that is trully pined.
+         // if we move, then the address of the children will cange, wich means that 
+         //ins't pined anymore, and that is UB.
+    }
+}
+
+impl <F: Future> Future for Timeout<F>{
+    type Output = Result<F::Output, ()>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        println!("\nTimeout.poll()");
+        let (mut future, mut sleep) = self.project();//don't ever move the children out of the reutrn of this function!!!!!
+
+        match Pin::new(&mut future).poll(cx) {
+            Poll::Ready(value) => {
+                println!("\nTimeout.poll(): Future won against sleep");
+                return Poll::Ready(Ok(value));
+            },
+            Poll::Pending => {},
+        }
+        match Pin::new(&mut sleep).poll(cx){
+            Poll::Ready(()) => {
+                println!("\nTimeout.poll(): Sleep won against future");
+                Poll::Ready(Err(()))
+            },
+            Poll::Pending => {
+                Poll::Pending
+            },
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::m0_task::{current_exec, Runtime};
+    use std::future::poll_fn;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Pending on the first poll, Ready on the second.
+    ///
+    /// The point is that poll #1 forces `Timeout` to reach the `Sleep` and
+    /// register it in the wheel. An inner future that is Ready immediately
+    /// never gets there, so `handle` stays `None` and the leak test below
+    /// would pass for the wrong reason.
+    struct PendingOnce {
+        polled: bool,
+    }
+
+    impl Future for PendingOnce {
+        type Output = u64;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+            if self.polled {
+                return Poll::Ready(7);
+            }
+            self.polled = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    /// Sets a flag when dropped. Held across an await inside the inner future,
+    /// so it only runs if that future is actually dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// `current_exec()` panics outside a runtime, so this only works inside a
+    /// `block_on` future.
+    fn live_timers() -> usize {
+        current_exec().time.lock().unwrap().count()
+    }
+
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_inner_future_wins_and_yields_its_value() {
+        let rt = Runtime::new();
+        let r = rt.block_on(async {
+            Timeout::new(PendingOnce { polled: false }, Sleep::sleep(Duration::from_secs(60))).await
+        });
+        assert_eq!(r, Ok(7));
+    }
+
+    /// **The test that decides M3.**
+    ///
+    /// 500 timeouts that all register a wheel entry and then complete before it
+    /// fires. Nothing cancels those entries except `Sleep::drop`, which runs
+    /// because dropping `Timeout` drops its `sleep` field. Delete that `Drop`
+    /// impl and this reports 500 corpses sitting in the wheel until their 60s
+    /// deadlines pass — which, on a real server, is the steady-state leak that
+    /// makes this milestone matter.
+    #[test]
+    fn completed_timeouts_leave_the_wheel_empty() {
+        let rt = Runtime::new();
+        rt.block_on(async {
+            for _ in 0..500 {
+                let r = Timeout::new(
+                    PendingOnce { polled: false },
+                    Sleep::sleep(Duration::from_secs(60)),
+                )
+                .await;
+                assert_eq!(r, Ok(7));
+            }
+
+            assert_eq!(
+                live_timers(),
+                0,
+                "a completed Timeout left its Sleep registered in the wheel"
+            );
+        });
+    }
+
+    /// When the deadline wins, the inner future is dropped where it stood — no
+    /// notification, no async cleanup. That IS cancellation in Rust.
+    #[test]
+    fn timing_out_drops_the_inner_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = dropped.clone();
+
+        let rt = Runtime::new();
+        let r = rt.block_on(async move {
+            Timeout::new(
+                async move {
+                    let _guard = DropFlag(flag); // alive across the await
+                    Sleep::sleep(Duration::from_secs(60)).await;
+                },
+                Sleep::sleep(Duration::from_millis(20)),
+            )
+            .await
+        });
+
+        assert_eq!(r, Err(()));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the inner future was not dropped when the timeout fired"
+        );
+    }
+
+    /// A fired timeout must also clean up: both its own `Sleep` and the one the
+    /// inner future had registered.
+    #[test]
+    fn a_fired_timeout_leaves_the_wheel_empty() {
+        let rt = Runtime::new();
+        rt.block_on(async {
+            let r = Timeout::new(
+                Sleep::sleep(Duration::from_secs(60)),
+                Sleep::sleep(Duration::from_millis(20)),
+            )
+            .await;
+
+            assert_eq!(r, Err(()));
+            assert_eq!(live_timers(), 0, "the inner future's timer outlived it");
+        });
+    }
+
+    /// Poll order, deterministically.
+    ///
+    /// The `Timeout` is built but NOT polled, then 30ms pass. Its 1ms deadline
+    /// is now long gone, so on the very first poll both arms are ready at once.
+    /// Polling the inner future first means the work wins. Swap the two `match`
+    /// blocks in `poll` and this returns `Err(())` — i.e. a 504 for a request
+    /// that actually succeeded.
+    #[test]
+    fn the_inner_future_wins_a_tie() {
+        let rt = Runtime::new();
+        let r = rt.block_on(async {
+            let mut t = Box::pin(Timeout::new(
+                async { 7u64 },
+                Sleep::sleep(Duration::from_millis(1)),
+            ));
+
+            Sleep::sleep(Duration::from_millis(30)).await;
+
+            poll_fn(move |cx| t.as_mut().poll(cx)).await
+        });
+
+        assert_eq!(
+            r,
+            Ok(7),
+            "poll order is reversed — the deadline beat completed work"
+        );
+    }
+
+    /// Nesting. The outer deadline fires first; dropping the outer `Timeout`
+    /// drops the inner one, which drops *its* two futures. Three registered
+    /// timers, all unwound by one `Drop` chain that nobody wrote by hand.
+    #[test]
+    fn nested_timeouts_clean_up() {
+        let rt = Runtime::new();
+        rt.block_on(async {
+            let r = Timeout::new(
+                Timeout::new(
+                    Sleep::sleep(Duration::from_secs(60)),
+                    Sleep::sleep(Duration::from_secs(30)),
+                ),
+                Sleep::sleep(Duration::from_millis(20)),
+            )
+            .await;
+
+            assert_eq!(r, Err(()));
+            assert_eq!(live_timers(), 0, "a nested timer survived the outer drop");
+        });
+    }
+}

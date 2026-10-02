@@ -179,6 +179,7 @@ impl Wake for Task {
         println!("\nwake(): putting task back into queue");
         let arc_bump = self.clone();
         self.exec.queue.lock().unwrap().push_back(arc_bump);
+        println!("\nwake(): task id {} added to queue", self.id);
 
         println!("\nwake(): unparking the thread: {:?}", thread::current().id());
         self
@@ -212,11 +213,15 @@ fn run(exec: Arc<Executor>) {
 
 struct  ThreadWaker{
     thread: thread::Thread,
+    notified: AtomicBool,
 }
 
 impl Wake for ThreadWaker{
     fn wake(self: Arc<Self>){
-        self.thread.unpark();
+        if !self.notified.swap(true, Ordering::AcqRel) {
+            println!("\nThreadWaker.wake(): unparking the thread: {:?}", thread::current().id());
+            self.thread.unpark();
+        }
     }
 }
 
@@ -303,9 +308,12 @@ impl Runtime {
 
         let _runtime_guard = RuntimeContextGurad::enter(self.exec.clone());
 
-        let waker = Waker::from(Arc::new(ThreadWaker{
+        let thread_waker = Arc::new(ThreadWaker{
             thread: thread.clone(),
-        }));
+            notified: AtomicBool::new(true),//initial poll
+        });
+
+        let waker = Waker::from(thread_waker.clone());
 
         let mut cx = Context::from_waker(&waker);
         let mut future_fixed_on_heap = Box::pin(future);
@@ -313,17 +321,28 @@ impl Runtime {
         let result = loop {
             let now = self.exec.time_source.now();
             let fired = self.exec.time.lock().unwrap().expire(now);
+
             for waker in fired{
                 waker.wake();
             }
             
-            if let Poll::Ready(v) = future_fixed_on_heap.as_mut().poll(&mut cx) {break v;}
+            if thread_waker.notified.swap(false, Ordering::AcqRel) {
+                println!("\nblock_on(): thread waker notified");
+                //poling the main future
+                if let Poll::Ready(v) = future_fixed_on_heap.as_mut().poll(&mut cx) {break v;}
+            }
+            
 
+            //running the tasks on the queue
             run(self.exec.clone());
 
             let now = self.exec.time_source.now();
             let next = self.exec.time.lock().unwrap().next_deadline();
-
+println!(
+    "block_on(): now={}, next_deadline={:?}",
+    now,
+    next
+);
             match next{
                 None => thread::park(),
                 Some(deadline) => {
@@ -356,6 +375,7 @@ impl Runtime {
         exec.owned.lock().unwrap().insert(task_id, task.clone());
 
         exec.queue.lock().unwrap().push_back(task);
+        println!("\nspawn(): spauwn pushing task id {} queue", task_id);
 
         println!("\nspawn(): task added to queue")
     }//build a new task.future and put it on the queue

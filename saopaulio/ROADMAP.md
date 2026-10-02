@@ -21,7 +21,7 @@ cargo doc --open           # the roadmap as rustdoc — this is the intended way
 | **M0** `m0_task` | `block_on` + `spawn` + a run queue | task, waker, run queue | done |
 | **M1** `m1_time` | `sleep(dur)` | the wheel | **wheel done**, integration pending |
 | **M2** `m2_io` | TCP via epoll | readiness, the driver stack | not started |
-| **M3** `m3_timeout` | `timeout(dur, fut)` | combinator, cancellation | not started |
+| **M3** `m3_timeout` | `timeout(dur, fut)` | combinator, cancellation | done |
 | **M4** `m4_worker` | N threads, per-thread queues, stealing | the worker | not started |
 | **M5** `m5_per_worker_time` | the wheel from shared to per-worker | the #7467 lesson, earned | not started |
 | **M6** `m6_lifecycle` | `JoinHandle`, abort, shutdown | who owns a task | not started |

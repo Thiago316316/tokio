@@ -190,7 +190,6 @@ struct Expiration {
     pub fn expire(&mut self, now: u64) -> Vec<T>{
         let mut expired = Vec::new();
         if now < self.elapsed{return expired;}
-
         while let Some(exp) = self.next_expiration(){
             if exp.deadline > now {break;}
             self.elapsed = self.elapsed.max(exp.deadline);
@@ -207,6 +206,10 @@ struct Expiration {
             }
         }
         self.elapsed = now + 1;
+        // Higher-level buckets are not fired directly.
+        // Expiring one cascades their entries into lower levels.
+        // The timer will eventually reach level 0, where it is actually fired.
+        println!("wheel.expire(): fired {} timers", expired.len());
         expired
     }
 
@@ -235,7 +238,7 @@ struct Expiration {
     }
 
     #[cfg(test)]
-    fn count(&self) -> usize{
+    pub(crate) fn count(&self) -> usize{
         self.levels
             .iter()
             .flat_map(|level| level.slots.iter())

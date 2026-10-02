@@ -27,7 +27,11 @@ impl Drop for Sleep {
         if let Some(h) = self.handle.take() {
             self.exec.time.lock().unwrap().cancel(h);
         }
-    }
+    }// sleep frequently is ignored, so the wake, despite being store on the 
+     //timer wheel, won't be necessary, so we need to clean up all timer wheel
+     //tracking system, which is wy we have the cancel(TimerHandler) function.
+     //Then we put in the drop() becuse as soon as the lifetime of the future
+     //ends, we drop  and clean automatically.
 }
 
 impl Future for Sleep{
