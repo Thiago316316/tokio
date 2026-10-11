@@ -97,7 +97,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering}}, task::{Context, Poll, Wake, Waker}, thread, time::Duration,
 };
 
-use crate::m1_time::{ wheel::Wheel};
+use crate::{m1_time::wheel::Wheel, m2_io::{driver::Driver, wake_fd::WakeFd}};
 use crate::time_source::TimeSource;
 
 pub(crate) struct Executor{
@@ -110,6 +110,8 @@ pub(crate) struct Executor{
     next_task_id: AtomicUsize,
     pub(crate) time: Mutex<Wheel<Waker>>,
     pub(crate) time_source: TimeSource,
+    driver: Driver,
+    pub wake_fd: Arc<WakeFd>
 }
 struct Task{
     future:Mutex<// lock gurad mechanism to handle data between threads.
@@ -181,6 +183,9 @@ impl Wake for Task {
         self.exec.queue.lock().unwrap().push_back(arc_bump);
         println!("\nwake(): task id {} added to queue", self.id);
 
+        println!("\nwake(): signaling the eventfd");
+        self.exec.wake_fd.wake();
+
         println!("\nwake(): unparking the thread: {:?}", thread::current().id());
         self
         .exec
@@ -212,15 +217,15 @@ fn run(exec: Arc<Executor>) {
 }
 
 struct  ThreadWaker{
-    thread: thread::Thread,
     notified: AtomicBool,
+    wake_fd: Arc<WakeFd>,
 }
 
 impl Wake for ThreadWaker{
     fn wake(self: Arc<Self>){
         if !self.notified.swap(true, Ordering::AcqRel) {
-            println!("\nThreadWaker.wake(): unparking the thread: {:?}", thread::current().id());
-            self.thread.unpark();
+            println!("\nThreadWaker.wake(): signaling the eventfd");
+            self.wake_fd.wake();
         }
     }
 }
@@ -286,6 +291,7 @@ pub struct Runtime {exec: Arc<Executor>}
 
 impl Runtime {
     pub fn new() -> Self {
+        let driver = Driver::new().unwrap();
         let executor = Self {
             exec:
                 Arc::new(Executor {
@@ -295,6 +301,8 @@ impl Runtime {
                 next_task_id: AtomicUsize::new(1),
                 time_source: TimeSource::new(),
                 time: Mutex::new(Wheel::<Waker>::new()),
+                wake_fd: driver.wake_handle().clone(),
+                driver: driver,
             })
         };
 
@@ -309,8 +317,8 @@ impl Runtime {
         let _runtime_guard = RuntimeContextGurad::enter(self.exec.clone());
 
         let thread_waker = Arc::new(ThreadWaker{
-            thread: thread.clone(),
             notified: AtomicBool::new(true),//initial poll
+            wake_fd: self.exec.wake_fd.clone(),
         });
 
         let waker = Waker::from(thread_waker.clone());
@@ -343,15 +351,14 @@ println!(
     now,
     next
 );
-            match next{
-                None => thread::park(),
+            let timeout_ms = match next {
+                None => -1,
                 Some(deadline) => {
-                    let wait = deadline.saturating_sub(now);
-                    if wait > 0 {
-                        thread::park_timeout(Duration::from_millis(wait));
-                    }
+                    deadline.saturating_sub(now).min(i32::MAX as u64) as i32
                 }
-            }
+            };
+
+            self.exec.driver.park(timeout_ms).unwrap();
         };
 
         result

@@ -105,3 +105,26 @@
 //! Loom section of the repo's `CLAUDE.md`. If you want a real contribution
 //! that is not a toy, `ScheduledIo` needs zero mio mocking and is the tractable
 //! half of it.
+/*TCP socket / TcpStream — represents the kernel's TCP connection and gives us read/write.
+ScheduledIo — remembers readiness and which task is waiting for read/write.
+epoll driver — asks the kernel which registered sockets are ready and turns those events into wakes.
+M1 + M2 park integration — sleep until either a timer expires or I/O becomes ready.
+eventfd/self-pipe — lets something outside epoll_wait wake the runtime thread.*/
+
+pub mod tcp_stream;
+pub mod schedule_io;
+pub mod driver;
+pub mod wake_fd;
+pub mod async_read;
+use std::{
+    io,
+};
+use tcp_stream::{ test_tcp_stream};
+
+
+
+pub fn main() -> io::Result<()> {
+   test_tcp_stream();
+
+    Ok(())
+}
